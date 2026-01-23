@@ -111,6 +111,7 @@ func (r *XMLRPCClient) processResponse(resp *http.Response, processBody func(io.
 func (r *XMLRPCClient) postInetHTTP(method string, url string, data interface{}, processBody func(io.ReadCloser, error)) {
 	req, err := r.createHTTPRequest(method, url, data)
 	if err != nil {
+		processBody(emptyReader, err)
 		return
 	}
 
@@ -122,9 +123,7 @@ func (r *XMLRPCClient) postInetHTTP(method string, url string, data interface{},
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		if r.verbose {
-			fmt.Println("Fail to send request to supervisord:", err)
-		}
+		processBody(emptyReader, fmt.Errorf("Fail to send http request to supervisord: %s", err))
 		return
 	}
 	r.processResponse(resp, processBody)
@@ -140,35 +139,31 @@ func (r *XMLRPCClient) postUnixHTTP(method string, path string, data interface{}
 		conn, err = net.Dial("unix", path)
 	}
 	if err != nil {
-		if r.verbose {
-			fmt.Printf("Fail to connect unix socket path: %s\n", r.serverurl)
-		}
+		processBody(emptyReader, fmt.Errorf("Fail to connect unix socket path: %s. %s", r.serverurl, err))
 		return
 	}
 	defer conn.Close()
 
 	if r.timeout > 0 {
 		if err := conn.SetDeadline(time.Now().Add(r.timeout)); err != nil {
+			processBody(emptyReader, err)
 			return
 		}
 	}
 	req, err := r.createHTTPRequest(method, "/RPC2", data)
 
 	if err != nil {
+		processBody(emptyReader, fmt.Errorf("Fail to create http request. %s", err))
 		return
 	}
 	err = req.Write(conn)
 	if err != nil {
-		if r.verbose {
-			fmt.Printf("Fail to write to unix socket %s\n", r.serverurl)
-		}
+		processBody(emptyReader, fmt.Errorf("Fail to write to unix socket %s", r.serverurl))
 		return
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
-		if r.verbose {
-			fmt.Printf("Fail to read response %s\n", err)
-		}
+		processBody(emptyReader, fmt.Errorf("Fail to read response %s", err))
 		return
 	}
 	r.processResponse(resp, processBody)
@@ -197,7 +192,7 @@ func (r *XMLRPCClient) GetVersion() (reply VersionReply, err error) {
 	r.post("supervisor.getVersion", &ins, func(body io.ReadCloser, procError error) {
 		err = procError
 		if err == nil {
-			err = xml.DecodeClientResponse(body, reply)
+			err = xml.DecodeClientResponse(body, &reply)
 		}
 	})
 	return
@@ -272,18 +267,11 @@ func (r *XMLRPCClient) ReloadConfig() (reply types.ReloadConfigResult, err error
 	reply.AddedGroup = make([]string, 0)
 	reply.ChangedGroup = make([]string, 0)
 	reply.RemovedGroup = make([]string, 0)
-	i := -1
-	hasValue := false
-	xmlProcMgr.AddNonLeafProcessor("methodResponse/params/param/value/array/data", func() {
-		if hasValue {
-			hasValue = false
-		} else {
-			i++
-		}
+	i := 0
+	xmlProcMgr.AddSwitchTypeProcessor("methodResponse/params/param/value/array/data", func() {
+		i++
 	})
 	xmlProcMgr.AddLeafProcessor("methodResponse/params/param/value/array/data/value", func(value string) {
-		hasValue = true
-		i++
 		switch i {
 		case 0:
 			reply.AddedGroup = append(reply.AddedGroup, value)
@@ -343,5 +331,85 @@ func (r *XMLRPCClient) GetProcessInfo(process string) (reply types.ProcessInfo, 
 		}
 	})
 
+	return
+}
+
+// StartProcess Start a process
+func (r *XMLRPCClient) StartProcess(process string, wait bool) (reply types.BooleanReply, err error) {
+	ins := struct {
+		Name string
+		Wait bool
+	}{
+		Name: process,
+		Wait: wait,
+	}
+	r.post("supervisor.startProcess", &ins, func(body io.ReadCloser, procError error) {
+		err = procError
+		if err == nil {
+			err = xml.DecodeClientResponse(body, &reply)
+			if err == nil {
+				return
+			}
+			ee, ok := err.(xml.Fault)
+			if !ok {
+				return
+			}
+			if ee.Code == ALREADY_STARTED {
+				err = nil
+			}
+		}
+	})
+	return
+}
+
+// StopProcess Stop a process named by name
+func (r *XMLRPCClient) StopProcess(process string, wait bool) (reply types.BooleanReply, err error) {
+	ins := struct {
+		Name string
+		Wait bool
+	}{
+		Name: process,
+		Wait: wait,
+	}
+	r.post("supervisor.stopProcess", &ins, func(body io.ReadCloser, procError error) {
+		err = procError
+		if err == nil {
+			err = xml.DecodeClientResponse(body, &reply)
+			if err == nil {
+				return
+			}
+			ee, ok := err.(xml.Fault)
+			if !ok {
+				return
+			}
+			if ee.Code == NOT_RUNNING {
+				err = nil
+			}
+		}
+	})
+	return
+}
+
+// StartAllProcesses Start all processes listed in the configuration file
+func (r *XMLRPCClient) StartAllProcesses(wait bool) (reply AllProcStatusInfoReply, err error) {
+	ins := struct{ Wait bool }{wait}
+	r.post("supervisor.startAllProcesses", &ins, func(body io.ReadCloser, procError error) {
+		err = procError
+		if err == nil {
+			err = xml.DecodeClientResponse(body, &reply)
+		}
+	})
+	return
+}
+
+// StopAllProcesses Stop all processes in the process list
+func (r *XMLRPCClient) StopAllProcesses(wait bool) (reply AllProcStatusInfoReply, err error) {
+	ins := struct{ Wait bool }{wait}
+	r.post("supervisor.stopAllProcesses", &ins, func(body io.ReadCloser, procError error) {
+		err = procError
+		if err == nil {
+			err = xml.DecodeClientResponse(body, &reply)
+		}
+	})
 	return
 }
