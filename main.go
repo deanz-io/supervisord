@@ -4,11 +4,9 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"unicode"
 
 	"github.com/jessevdk/go-flags"
@@ -25,12 +23,24 @@ type Options struct {
 	Configuration string `short:"c" long:"configuration" description:"the configuration file"`
 	Daemon        bool   `short:"d" long:"daemon" description:"run as daemon"`
 	EnvFile       string `long:"env-file" description:"the environment file"`
+	// NoDaemon and LogLevel accept Python supervisord's -n and -e so that
+	// command lines written for it keep working.
+	NoDaemon bool   `short:"n" long:"nodaemon" description:"run in the foreground, the default; overrides -d"`
+	LogLevel string `short:"e" long:"loglevel" description:"log level (critical, error, warn, info, debug); overrides loglevel in the configuration file"`
+}
+
+// shouldDaemonize reports whether supervisord should detach; -n wins over -d
+// as it does in Python supervisord.
+func (o *Options) shouldDaemonize() bool {
+	return o.Daemon && !o.NoDaemon
 }
 
 func init() {
 	nullLogger := logger.NewNullLogger(logger.NewNullLogEventEmitter())
-	log.SetOutput(nullLogger)
+	//log.SetOutput(nullLogger)
+	log.SetOutput(logger.NewReformatLog(nullLogger))
 	logFormat := os.Getenv("LOG_FORMAT")
+
 	if logFormat == "json" {
 		log.SetFormatter(&log.JSONFormatter{})
 	} else {
@@ -41,18 +51,8 @@ func init() {
 		}
 	}
 	log.SetLevel(log.DebugLevel)
-}
 
-func initSignals(s *Supervisor) {
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigs
-		log.WithFields(log.Fields{"signal": sig}).Info("receive a signal to stop all process & exit")
-		s.procMgr.StopAllProcesses()
-		os.Exit(-1)
-	}()
-
+	enableConsoleVT()
 }
 
 var options Options
@@ -129,18 +129,21 @@ func findSupervisordConf() (string, error) {
 	return "", fmt.Errorf("fail to find supervisord.conf")
 }
 
+func initServer() (*Supervisor, error) {
+	loadEnvFile()
+	if len(options.Configuration) <= 0 {
+		options.Configuration, _ = findSupervisordConf()
+	}
+	s := NewSupervisor(options.Configuration)
+	if sErr := s.Reload(RestartAll); sErr != nil {
+		panic(sErr)
+	}
+	return s, nil
+}
 func runServer() {
 	// infinite loop for handling Restart ('reload' command)
-	loadEnvFile()
 	for {
-		if len(options.Configuration) <= 0 {
-			options.Configuration, _ = findSupervisordConf()
-		}
-		s := NewSupervisor(options.Configuration)
-		initSignals(s)
-		if _, _, _, sErr := s.Reload(true); sErr != nil {
-			panic(sErr)
-		}
+		s, _ := initServer()
 		s.WaitForExit()
 	}
 }
@@ -165,21 +168,18 @@ func getSupervisordLogFile(configFile string) string {
 }
 
 func main() {
-	if BuildVersion != "" { VERSION = BuildVersion }
+	if BuildVersion != "" {
+		version = BuildVersion
+	}
+
 	ReapZombie()
 
 	// when execute `supervisord` without sub-command, it should start the server
 	parser.Command.SubcommandsOptional = true
 	parser.CommandHandler = func(command flags.Commander, args []string) error {
 		if command == nil {
-			log.SetOutput(os.Stdout)
-			if options.Daemon {
-				logFile := getSupervisordLogFile(options.Configuration)
-				Daemonize(logFile, runServer)
-			} else {
-				runServer()
-			}
-			os.Exit(0)
+			pureService := &ServiceCommand{}
+			return pureService.RunServer()
 		}
 		return command.Execute(args)
 	}
@@ -195,6 +195,9 @@ func main() {
 				_, _ = fmt.Fprintf(os.Stderr, "error when parsing command: %s\n", err)
 				os.Exit(1)
 			}
+		} else {
+			runServer()
 		}
 	}
+
 }

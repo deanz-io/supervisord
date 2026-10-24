@@ -2,17 +2,16 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"testing"
-
-	"github.com/ochinchina/supervisord/util"
 )
 
 func createTmpFile() (string, error) {
-	f, err := ioutil.TempFile("", "tmp")
+	f, err := os.CreateTemp("", "tmp")
+
 	if err == nil {
 		f.Close()
 		return f.Name(), err
@@ -27,7 +26,7 @@ func saveToTmpFile(b []byte) (string, error) {
 		return "", err
 	}
 
-	ioutil.WriteFile(f, b, os.ModePerm)
+	os.WriteFile(f, b, os.ModePerm)
 
 	return f, nil
 }
@@ -88,31 +87,31 @@ func TestGetStringValueFromConfig(t *testing.T) {
 func TestGetEnvValueFromConfig(t *testing.T) {
 	config, _ := parse([]byte("[program:test]\na=A=\"env1\",B=env2"))
 	entry := config.GetProgram("test")
-	envs := make([]interface{}, 0)
+	envs := make([]any, 0)
 	for _, e := range entry.GetEnv("a") {
 		envs = append(envs, e)
 	}
-	if len(envs) != 2 || !util.InArray("A=env1", envs) || !util.InArray("B=env2", envs) {
+	if len(envs) != 2 || !slices.Contains(envs, "A=env1") || !slices.Contains(envs, "B=env2") {
 		t.Error("Fail to get env value")
 	}
 
 	config, _ = parse([]byte("[program:test]\na=A=env1,B=\"env2\""))
 	entry = config.GetProgram("test")
-	envs = make([]interface{}, 0)
+	envs = make([]any, 0)
 	for _, e := range entry.GetEnv("a") {
 		envs = append(envs, e)
 	}
-	if len(envs) != 2 || !util.InArray("A=env1", envs) || !util.InArray("B=env2", envs) {
+	if len(envs) != 2 || !slices.Contains(envs, "A=env1") || !slices.Contains(envs, "B=env2") {
 		t.Error("Fail to get env value")
 	}
 
 }
 
 func TestGetBytesFromConfig(t *testing.T) {
-	config, _ := parse([]byte("[program:test]\nA=1024\nB=2KB\nC=3MB\nD=4GB\nE=test"))
+	config, _ := parse([]byte("[program:test]\nA=1024\nB=2KB\nC=3MB\nD=1GB\nE=test"))
 	entry := config.GetProgram("test")
 
-	if entry.GetBytes("A", 0) != 1024 || entry.GetBytes("B", 0) != 2048 || entry.GetBytes("C", 0) != 3*1024*1024 || entry.GetBytes("D", 0) != 4*1024*1024*1024 || entry.GetBytes("E", 0) != 0 || entry.GetBytes("F", -1) != -1 {
+	if entry.GetBytes("A", 0) != 1024 || entry.GetBytes("B", 0) != 2048 || entry.GetBytes("C", 0) != 3*1024*1024 || entry.GetBytes("D", 0) != 1*1024*1024*1024 || entry.GetBytes("E", 0) != 0 || entry.GetBytes("F", -1) != -1 {
 		t.Error("Fail to get bytes")
 	}
 
@@ -171,16 +170,16 @@ func TestToRegex(t *testing.T) {
 }
 
 func TestConfigWithInclude(t *testing.T) {
-	dir, _ := ioutil.TempDir("", "tmp")
+	// a private directory: the test used os.TempDir() and then removed it,
+	// deleting everything in the system temp directory
+	dir := t.TempDir()
 
-	ioutil.WriteFile(filepath.Join(dir, "file1"), []byte("[program:cat]\ncommand=pwd\nA=abc\n[include]\nfiles=*.conf"), os.ModePerm)
-	ioutil.WriteFile(filepath.Join(dir, "file2.conf"), []byte("[program:ls]\ncommand=ls\n"), os.ModePerm)
+	os.WriteFile(filepath.Join(dir, "file1"), []byte("[program:cat]\ncommand=pwd\nA=abc\n[include]\nfiles=*.conf"), os.ModePerm)
+	os.WriteFile(filepath.Join(dir, "file2.conf"), []byte("[program:ls]\ncommand=ls\n"), os.ModePerm)
 
 	fmt.Println(filepath.Join(dir, "file1"))
 	config := NewConfig(filepath.Join(dir, "file1"))
 	config.Load()
-
-	os.RemoveAll(filepath.Join(dir))
 
 	entry := config.GetProgram("ls")
 
@@ -208,4 +207,31 @@ func TestDefaultParams(t *testing.T) {
 		t.Error("autorestart value should be true")
 	}
 
+}
+
+func TestConfigSub(t *testing.T) {
+	config1, _ := parse([]byte("[program:test1]\ncommand=/bin/ls\n[program:test2]\ncommand=/bin/pwd\n[program:test3]\ncommand=/bin/echo\n[group:test]\nprograms=test1,test2\n"))
+	config2, _ := parse([]byte("[program:test1]\ncommand=/bin/ls\n[program:test3]\ncommand=/bin/pwd\n[program:test4]\ncommand=/bin/echo\n[group:test]\nprograms=test2,test1\n"))
+
+	diff, _ := config2.Sub(config1)
+
+	if len(diff.AddedPrograms) != 1 || diff.AddedPrograms[0] != "test4" {
+		t.Error("Fail to get added programs")
+	}
+
+	if len(diff.AddedGroups) != 1 || diff.AddedGroups[0] != "test4" {
+		t.Error("Fail to get added programs")
+	}
+
+	if len(diff.RemovedPrograms) != 1 || diff.RemovedPrograms[0] != "test2" {
+		t.Error("Fail to get removed programs")
+	}
+
+	if len(diff.ChangedPrograms) != 1 || diff.ChangedPrograms[0] != "test3" {
+		t.Error("Fail to get changed programs")
+	}
+
+	if len(diff.ChangedGroups) != 1 || diff.ChangedGroups[0] != "test3" {
+		t.Error("Fail to get changed programs")
+	}
 }

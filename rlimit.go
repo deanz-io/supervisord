@@ -1,3 +1,4 @@
+//go:build !windows && !freebsd
 // +build !windows,!freebsd
 
 package main
@@ -20,15 +21,15 @@ func (s *Supervisor) checkRequiredResources() error {
 }
 
 func (s *Supervisor) getMinRequiredRes(resourceName string) (uint64, error) {
-	if entry, ok := s.config.GetSupervisord(); ok {
+	if entry, ok := s.activeConfig.GetSupervisord(); ok {
 		value := uint64(entry.GetInt(resourceName, 0))
 		if value > 0 {
 			return value, nil
 		} else {
-			return 0, fmt.Errorf("No such key %s", resourceName)
+			return 0, fmt.Errorf("no such key %s", resourceName)
 		}
 	} else {
-		return 0, fmt.Errorf("No supervisord section")
+		return 0, fmt.Errorf("no supervisord section")
 	}
 
 }
@@ -50,7 +51,7 @@ func (s *Supervisor) checkMinLimit(resource int, resourceName string, minRequire
 
 	limit.Cur = limit.Max
 	if syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit) != nil {
-		return fmt.Errorf(fmt.Sprintf("fail to set the %s to %d", resourceName, limit.Cur))
+		return fmt.Errorf("fail to set the %s to %d", resourceName, limit.Cur)
 	}
 	return nil
 }

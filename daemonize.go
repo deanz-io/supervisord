@@ -9,8 +9,8 @@ import (
 )
 
 // Daemonize run this process in daemon mode
-func Daemonize(logfile string, proc func()) {
-	context := daemon.Context{LogFileName: logfile, PidFileName: "supervisord.pid"}
+func Daemonize(logfile string, pidfile string, proc func()) {
+	context := daemon.Context{LogFileName: logfile, PidFileName: pidfile}
 
 	child, err := context.Reborn()
 	if err != nil {
@@ -23,6 +23,6 @@ func Daemonize(logfile string, proc func()) {
 	if child != nil {
 		return
 	}
-	defer context.Release()
+	defer func() { _ = context.Release() }()
 	proc()
 }

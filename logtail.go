@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
-	"github.com/ochinchina/supervisord/logger"
 	"net/http"
+
+	"github.com/ochinchina/supervisord/logger"
 
 	"github.com/gorilla/mux"
 )
@@ -58,7 +59,7 @@ func (lt *Logtail) getLog(logType string, w http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	s, err := compositeLogger.ReadLog(0, 0)
+	s, err := compositeLogger.ReadLog(-1600, 0)
 	if err != nil {
 		fmt.Println(err)
 		w.WriteHeader(http.StatusBadRequest)
@@ -67,28 +68,24 @@ func (lt *Logtail) getLog(logType string, w http.ResponseWriter, req *http.Reque
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 
-	w.Write([]byte(s))
-	//
-	//if ok {
-	//	w.Header().Set("Transfer-Encoding", "chunked")
-	//	w.WriteHeader(http.StatusOK)
-	//	flusher, _ := w.(http.Flusher)
-	//	ch := make(chan []byte, 100)
-	//	chanLogger := logger.NewChanLogger(ch)
-	//	compositeLogger.AddLogger(chanLogger)
-	//	for {
-	//		text, ok := <-ch
-	//		if !ok {
-	//			break
-	//		}
-	//		_, err := w.Write(text)
-	//		if err != nil {
-	//			break
-	//		}
-	//		flusher.Flush()
-	//	}
-	//	compositeLogger.RemoveLogger(chanLogger)
-	//	_ = chanLogger.Close()
-	//}
+	_, _ = w.Write([]byte(s))
+	flusher, _ := w.(http.Flusher)
+	flusher.Flush()
+	ch := make(chan []byte, 100)
+	chanLogger := logger.NewChanLogger(ch)
+	compositeLogger.AddLogger(chanLogger)
+	for {
+		text, ok := <-ch
+		if !ok {
+			break
+		}
+		_, err := w.Write(text)
+		if err != nil {
+			break
+		}
+		flusher.Flush()
+	}
+	compositeLogger.RemoveLogger(chanLogger)
+	_ = chanLogger.Close()
 
 }

@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/kardianos/service"
+	"github.com/ochinchina/supervisord/logger"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -13,7 +15,13 @@ type ServiceCommand struct {
 
 var serviceCommand ServiceCommand
 
-type program struct{}
+type program struct {
+	supervisor *Supervisor
+}
+
+func NewProgram() *program {
+	return &program{}
+}
 
 // Start supervised service
 func (p *program) Start(s service.Service) error {
@@ -21,11 +29,28 @@ func (p *program) Start(s service.Service) error {
 	return nil
 }
 
-func (p *program) run() {}
+func (p *program) run() {
+	log.SetOutput(logger.NewReformatLog(os.Stdout))
+	if options.shouldDaemonize() {
+		logFile := getSupervisordLogFile(options.Configuration)
+		p.supervisor, _ = initServer()
+		pidfile := p.supervisor.GetPidFile()
+		Daemonize(logFile, pidfile, func() {
+			p.supervisor.WaitForExit()
+		})
+	} else {
+		p.supervisor, _ = initServer()
+		p.supervisor.WaitForExit()
+		//runServer()
+	}
+}
 
 // Stop supervised service
 func (p *program) Stop(s service.Service) error {
 	// Stop should not block. Return with a few seconds.
+	if p.supervisor != nil {
+		p.supervisor.procMgr.StopAllProcesses()
+	}
 	return nil
 }
 
@@ -69,7 +94,7 @@ func (sc ServiceCommand) Execute(args []string) error {
 			fmt.Println("Succeed to install service go-supervisord")
 		}
 	case "uninstall":
-		s.Stop()
+		_ = s.Stop()
 		err := s.Uninstall()
 		if err != nil {
 			log.Error("Failed to uninstall service go-supervisord: ", err)
@@ -104,12 +129,37 @@ func (sc ServiceCommand) Execute(args []string) error {
 	return nil
 }
 
+func (sc *ServiceCommand) RunServer() error {
+	serviceArgs := make([]string, 0)
+	if options.Configuration != "" {
+		serviceArgs = append(serviceArgs, "--configuration="+options.Configuration)
+	}
+	if options.EnvFile != "" {
+		serviceArgs = append(serviceArgs, "--env-file="+options.EnvFile)
+	}
+
+	svcConfig := &service.Config{
+		Name:        "go-supervisord",
+		DisplayName: "go-supervisord",
+		Description: "Supervisord service in golang",
+		Arguments:   serviceArgs,
+	}
+	prg := &program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Error("service init failed", err)
+		return err
+	}
+
+	return s.Run()
+}
+
 func showUsage() {
 	fmt.Println("usage: supervisord service install/uninstall/start/stop")
 }
 
 func init() {
-	parser.AddCommand("service",
+	_, _ = parser.AddCommand("service",
 		"install/uninstall/start/stop service",
 		"install/uninstall/start/stop service",
 		&serviceCommand)

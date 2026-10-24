@@ -108,14 +108,12 @@ func (xpm *XMLProcessorManager) ProcessXML(reader io.Reader) {
 			break
 		}
 
-		switch tk.(type) {
+		switch tk := tk.(type) {
 		case xml.StartElement:
-			startElem, _ := tk.(xml.StartElement)
-			curPath.AddChild(startElem.Name.Local)
+			curPath.AddChild(tk.Name.Local)
 			curData = nil
 		case xml.CharData:
-			data, _ := tk.(xml.CharData)
-			curData = data.Copy()
+			curData = tk.Copy()
 		case xml.EndElement:
 			if curData != nil {
 				xpm.ProcessLeafNode(curPath.String(), string(curData))
@@ -123,5 +121,6 @@ func (xpm *XMLProcessorManager) ProcessXML(reader io.Reader) {
 			xpm.ProcessSwitchTypeNode(curPath.String())
 			curPath.RemoveLast()
 		}
+
 	}
 }

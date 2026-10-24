@@ -4,12 +4,12 @@ import (
 	"crypto/sha1" //nolint:gosec
 	"encoding/hex"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/gorilla/rpc"
 	"github.com/ochinchina/gorilla-xmlrpc/xml"
@@ -22,8 +22,9 @@ import (
 // XMLRPC mange the XML RPC servers
 // start XML RPC servers to accept the XML RPC request from client side
 type XMLRPC struct {
-	// all the listeners to accept the XML RPC request
-	listeners map[string]net.Listener
+	mu            sync.Mutex
+	listeners     map[string]net.Listener
+	procCollector prometheus.Collector
 }
 
 type httpBasicAuth struct {
@@ -34,22 +35,17 @@ type httpBasicAuth struct {
 
 // create a new HttpBasicAuth object with username, password and the http request handler
 func newHTTPBasicAuth(user string, password string, handler http.Handler) *httpBasicAuth {
-	if user != "" && password != "" {
-		log.Debug("require authentication")
-	}
 	return &httpBasicAuth{user: user, password: password, handler: handler}
 }
 
 func (h *httpBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.user == "" || h.password == "" {
-		log.Debug("no auth required")
 		h.handler.ServeHTTP(w, r)
 		return
 	}
 	username, password, ok := r.BasicAuth()
 	if ok && username == h.user {
 		if strings.HasPrefix(h.password, "{SHA}") {
-			log.Debug("auth with SHA")
 			hash := sha1.New() //nolint:gosec
 			io.WriteString(hash, password)
 			if hex.EncodeToString(hash.Sum(nil)) == h.password[5:] {
@@ -57,7 +53,6 @@ func (h *httpBasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else if password == h.password {
-			log.Debug("Auth with normal password")
 			h.handler.ServeHTTP(w, r)
 			return
 		}
@@ -74,6 +69,8 @@ func NewXMLRPC() *XMLRPC {
 // Stop network listening
 func (p *XMLRPC) Stop() {
 	log.Info("stop listening")
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for _, listener := range p.listeners {
 		listener.Close()
 	}
@@ -84,16 +81,18 @@ func (p *XMLRPC) Stop() {
 // must provide user and password for basic authentication when making an XML RPC request.
 func (p *XMLRPC) StartUnixHTTPServer(user string, password string, listenAddr string, s *Supervisor, startedCb func()) {
 	os.Remove(listenAddr)
-	p.startHTTPServer(user, password, "unix", listenAddr, s, startedCb)
+	p.startHTTPServer(user, password, "unix", listenAddr, s, make(map[string]*NodeLoginInfo), startedCb)
 }
 
 // StartInetHTTPServer start http server on tcp with path listenAddr. If both user and password are not empty, the user
 // must provide user and password for basic authentication when making an XML RPC request.
-func (p *XMLRPC) StartInetHTTPServer(user string, password string, listenAddr string, s *Supervisor, startedCb func()) {
-	p.startHTTPServer(user, password, "tcp", listenAddr, s, startedCb)
+func (p *XMLRPC) StartInetHTTPServer(user string, password string, listenAddr string, s *Supervisor, remoteSupervisors map[string]*NodeLoginInfo, startedCb func()) {
+	p.startHTTPServer(user, password, "tcp", listenAddr, s, remoteSupervisors, startedCb)
 }
 
 func (p *XMLRPC) isHTTPServerStartedOnProtocol(protocol string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	_, ok := p.listeners[protocol]
 	return ok
 }
@@ -104,7 +103,7 @@ func readFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	b, err := ioutil.ReadAll(f)
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +112,7 @@ func readFile(path string) ([]byte, error) {
 }
 
 func getProgramConfigPath(programName string, s *Supervisor) string {
-	c := s.config.GetProgram(programName)
+	c := s.activeConfig.GetProgram(programName)
 	if c == nil {
 		return ""
 	}
@@ -123,7 +122,21 @@ func getProgramConfigPath(programName string, s *Supervisor) string {
 }
 
 func readLogHtml(writer http.ResponseWriter, request *http.Request) {
-	b, err := readFile("webgui/log.html")
+
+	var b []byte
+	var err error
+
+	if HTTP != nil {
+		var file http.File
+		file, err = HTTP.Open("log.html")
+		if err == nil {
+			defer file.Close()
+			b, err = io.ReadAll(file)
+		}
+	} else {
+		b, err = readFile("webgui/log.html")
+	}
+
 	if err != nil {
 		writer.WriteHeader(http.StatusNotFound)
 		return
@@ -133,20 +146,29 @@ func readLogHtml(writer http.ResponseWriter, request *http.Request) {
 	writer.Write(b)
 }
 
-func (p *XMLRPC) startHTTPServer(user string, password string, protocol string, listenAddr string, s *Supervisor, startedCb func()) {
+func (p *XMLRPC) startHTTPServer(user string, password string, protocol string, listenAddr string, s *Supervisor, remoteSupervisors map[string]*NodeLoginInfo, startedCb func()) {
 	if p.isHTTPServerStartedOnProtocol(protocol) {
 		startedCb()
 		return
 	}
-	procCollector := process.NewProcCollector(s.procMgr)
-	prometheus.Register(procCollector)
+	// Unregister any previously registered collector before creating a new one
+	// so that config reloads don't accumulate stale collectors.
+	p.mu.Lock()
+	if p.procCollector != nil {
+		prometheus.Unregister(p.procCollector)
+	}
+	p.procCollector = process.NewProcCollector(s.procMgr)
+	prometheus.Register(p.procCollector)
+	p.mu.Unlock()
 	mux := http.NewServeMux()
 	mux.Handle("/RPC2", newHTTPBasicAuth(user, password, p.createRPCServer(s)))
 
-	progRestHandler := NewSupervisorRestful(s).CreateProgramHandler()
+	supervisorRestful := NewSupervisorRestful(s).AddRemoteSupervisors(remoteSupervisors)
+
+	progRestHandler := supervisorRestful.CreateProgramHandler()
 	mux.Handle("/program/", newHTTPBasicAuth(user, password, progRestHandler))
 
-	supervisorRestHandler := NewSupervisorRestful(s).CreateSupervisorHandler()
+	supervisorRestHandler := supervisorRestful.CreateSupervisorHandler()
 	mux.Handle("/supervisor/", newHTTPBasicAuth(user, password, supervisorRestHandler))
 
 	// 有bug已弃用
@@ -176,7 +198,7 @@ func (p *XMLRPC) startHTTPServer(user string, password string, protocol string, 
 	mux.Handle("/metrics", promhttp.Handler())
 
 	// 注册日志路由,可以查看日志目录
-	entryList := s.config.GetPrograms()
+	entryList := s.activeConfig.GetPrograms()
 	for _, c := range entryList {
 		realName := c.GetProgramName()
 		if realName == "" {
@@ -188,13 +210,17 @@ func (p *XMLRPC) startHTTPServer(user string, password string, protocol string, 
 			continue
 		}
 		dir := filepath.Dir(filePath)
-		mux.Handle("/log/"+realName+"/", http.StripPrefix("/log/"+realName+"/", http.FileServer(http.Dir(dir))))
+		prefix := "/log/" + realName + "/"
+		mux.Handle(prefix, newHTTPBasicAuth(user, password,
+			http.StripPrefix(prefix, http.FileServer(http.Dir(dir)))))
 	}
 
 	listener, err := net.Listen(protocol, listenAddr)
 	if err == nil {
 		log.WithFields(log.Fields{"addr": listenAddr, "protocol": protocol}).Info("success to listen on address")
+		p.mu.Lock()
 		p.listeners[protocol] = listener
+		p.mu.Unlock()
 		startedCb()
 		http.Serve(listener, mux)
 	} else {
@@ -241,5 +267,6 @@ func (p *XMLRPC) createRPCServer(s *Supervisor) *rpc.Server {
 	xmlrpcCodec.RegisterAlias("supervisor.tailProcessStderrLog", "Supervisor.TailProcessStderrLog")
 	xmlrpcCodec.RegisterAlias("supervisor.clearProcessLogs", "Supervisor.ClearProcessLogs")
 	xmlrpcCodec.RegisterAlias("supervisor.clearAllProcessLogs", "Supervisor.ClearAllProcessLogs")
+
 	return RPC
 }

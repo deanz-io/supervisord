@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -14,6 +18,15 @@ import (
 	"github.com/ochinchina/go-ini"
 	log "github.com/sirupsen/logrus"
 )
+
+type ConfigSubResult struct {
+	AddedGroups     []string
+	AddedPrograms   []string
+	RemovedGroups   []string
+	RemovedPrograms []string
+	ChangedGroups   []string
+	ChangedPrograms []string
+}
 
 // Entry standards for a configuration section in supervisor configuration file
 type Entry struct {
@@ -69,13 +82,14 @@ func (c *Entry) GetPrograms() []string {
 		for i, p := range r {
 			r[i] = strings.TrimSpace(p)
 		}
+		sort.Strings(r)
 		return r
 	}
 	return make([]string, 0)
 }
 
-func (c *Entry) setGroup(group string) {
-	c.Group = group
+func (c *Entry) ContainProgram(program string) bool {
+	return slices.Contains(c.GetPrograms(), program)
 }
 
 // String dumps configuration as a string
@@ -84,7 +98,31 @@ func (c *Entry) String() string {
 	for k, v := range c.keyValues {
 		fmt.Fprintf(buf, "%s=%s\n", k, v)
 	}
+
 	return buf.String()
+}
+
+// Determine if this entry is exactly same as the other entry. The name, group and all the key-values must be the same.
+func (c *Entry) IsSame(other *Entry) bool {
+	if c.Name != other.Name {
+		return false
+	}
+	if c.Group != other.Group {
+		return false
+	}
+	if c.IsGroup() {
+		return other.IsGroup() && reflect.DeepEqual(c.GetPrograms(), other.GetPrograms())
+	}
+	if len(c.keyValues) != len(other.keyValues) {
+		return false
+	}
+
+	for k, v := range c.keyValues {
+		if otherV, ok := other.keyValues[k]; !ok || v != otherV {
+			return false
+		}
+	}
+	return true
 }
 
 // Config memory representation of supervisor configuration file
@@ -93,7 +131,7 @@ type Config struct {
 	// mapping between the section name and configuration entry
 	entries map[string]*Entry
 
-	ProgramGroup *ProcessGroup
+	//ProgramGroup *ProcessGroup
 }
 
 // NewEntry creates configuration entry
@@ -103,7 +141,7 @@ func NewEntry(configDir string) *Entry {
 
 // NewConfig creates Config object
 func NewConfig(configFile string) *Config {
-	return &Config{configFile, make(map[string]*Entry), NewProcessGroup()}
+	return &Config{configFile, make(map[string]*Entry)}
 }
 
 // create a new entry or return the already-exist entry
@@ -117,11 +155,10 @@ func (c *Config) createEntry(name string, configDir string) *Entry {
 	return entry
 }
 
-//
 // Load the configuration and return loaded programs
 func (c *Config) Load() ([]string, error) {
 	myini := ini.NewIni()
-	c.ProgramGroup = NewProcessGroup()
+	//c.ProgramGroup = NewProcessGroup()
 	log.WithFields(log.Fields{"file": c.configFile}).Info("load configuration from file")
 	myini.LoadFile(c.configFile)
 
@@ -131,6 +168,58 @@ func (c *Config) Load() ([]string, error) {
 		myini.LoadFile(f)
 	}
 	return c.parse(myini), nil
+}
+
+func (c *Config) GetGroups() []string {
+	programGroups := make(map[string]string)
+	groups := make(map[string]bool)
+	for _, entry := range c.entries {
+		if entry.IsGroup() {
+			for _, program := range entry.GetPrograms() {
+				programGroups[program] = entry.GetGroupName()
+			}
+		}
+	}
+	for _, entry := range c.entries {
+		if entry.IsProgram() {
+			if _, ok := programGroups[entry.GetProgramName()]; !ok {
+				programGroups[entry.GetProgramName()] = entry.GetProgramName()
+			}
+		}
+	}
+
+	for _, group := range programGroups {
+		groups[group] = true
+	}
+	result := make([]string, 0)
+	for group := range groups {
+		result = append(result, group)
+	}
+	return result
+}
+
+func (c *Config) GetGroupProgram(group string) []string {
+	for _, entry := range c.entries {
+		if entry.IsGroup() && entry.GetGroupName() == group {
+			return entry.GetPrograms()
+		}
+	}
+
+	for _, entry := range c.entries {
+		if entry.IsProgram() && entry.GetProgramName() == group {
+			return []string{group}
+		}
+	}
+	return make([]string, 0)
+}
+
+func (c *Config) GetProgramGroup(program string) string {
+	for _, entry := range c.entries {
+		if entry.IsGroup() && entry.ContainProgram(program) {
+			return entry.GetGroupName()
+		}
+	}
+	return program
 }
 
 func (c *Config) getIncludeFiles(cfg *ini.Ini) []string {
@@ -206,6 +295,10 @@ func (c *Config) GetConfigFileDir() string {
 	return filepath.Dir(c.configFile)
 }
 
+func (c *Config) GetConfigFile() string {
+	return c.configFile
+}
+
 // convert supervisor file pattern to the go regrexp
 func toRegexp(pattern string) string {
 	tmp := strings.Split(pattern, ".")
@@ -252,11 +345,50 @@ func (c *Config) GetEntries(filterFunc func(entry *Entry) bool) []*Entry {
 	return result
 }
 
-// GetGroups returns configuration entries of all program groups
-func (c *Config) GetGroups() []*Entry {
-	return c.GetEntries(func(entry *Entry) bool {
-		return entry.IsGroup()
-	})
+// GetAllEntries returns all configuration entries
+func (c *Config) GetAllEntries() []*Entry {
+	result := make([]*Entry, 0)
+	for _, entry := range c.entries {
+		result = append(result, entry)
+	}
+	return result
+
+}
+
+func (c *Config) AddEntry(entry *Entry) (*Entry, bool) {
+	name := entry.Name
+	if entry.IsProgram() {
+		name = entry.GetProgramName()
+	}
+	if existingEntry, ok := c.entries[name]; !ok || !existingEntry.IsSame(entry) {
+		c.entries[name] = entry
+		return entry, true
+	}
+	return nil, false
+}
+
+func (c *Config) RemoveEntry(name string) (*Entry, bool) {
+	if existingEntry, ok := c.entries[name]; ok {
+		delete(c.entries, name)
+		return existingEntry, true
+	}
+	return nil, false
+}
+
+func (c *Config) GetEntry(name string) (*Entry, bool) {
+	entry, ok := c.entries[name]
+	return entry, ok
+}
+
+func (c *Config) GetProgramEntriesInGroup(group string) []*Entry {
+	programs := c.GetGroupProgram(group)
+	result := make([]*Entry, 0)
+	for _, program := range programs {
+		if entry, ok := c.entries[program]; ok && entry.IsProgram() {
+			result = append(result, entry)
+		}
+	}
+	return result
 }
 
 // GetPrograms returns configuration entries of all programs
@@ -402,15 +534,14 @@ func parseEnvFiles(s string) *map[string]string {
 			}).Error("Parse env file failed: " + envFilePath)
 			continue
 		}
-		for k, v := range r {
-			result[k] = v
-		}
+		maps.Copy(result, r)
 	}
 	return &result
 }
 
 // GetEnv returns slice of strings with keys separated from values by single "=". An environment string example:
-//  environment = A="env 1",B="this is a test"
+//
+//	environment = A="env 1",B="this is a test"
 func (c *Entry) GetEnv(key string) []string {
 	value, ok := c.keyValues[key]
 	result := make([]string, 0)
@@ -431,7 +562,9 @@ func (c *Entry) GetEnv(key string) []string {
 }
 
 // GetEnvFromFiles returns slice of strings with keys separated from values by single "=". An envFile example:
-//  envFiles = global.env,prod.env
+//
+//	envFiles = global.env,prod.env
+//
 // cat global.env
 // varA=valueA
 func (c *Entry) GetEnvFromFiles(key string) []string {
@@ -476,7 +609,7 @@ func (c *Entry) GetString(key string, defValue string) string {
 func (c *Entry) GetStringExpression(key string, defValue string) string {
 	s, ok := c.keyValues[key]
 	if !ok || s == "" {
-		return ""
+		return defValue
 	}
 
 	hostName, err := os.Hostname()
@@ -517,18 +650,18 @@ func (c *Entry) GetStringArray(key string, sep string) []string {
 //	logSize=1GB
 //	logSize=1KB
 //	logSize=1024
-//
 func (c *Entry) GetBytes(key string, defValue int) int {
 	v, ok := c.keyValues[key]
 
 	if ok {
 		if len(v) > 2 {
 			lastTwoBytes := v[len(v)-2:]
-			if lastTwoBytes == "MB" {
+			switch lastTwoBytes {
+			case "MB":
 				return toInt(v[:len(v)-2], 1024*1024, defValue)
-			} else if lastTwoBytes == "GB" {
+			case "GB":
 				return toInt(v[:len(v)-2], 1024*1024*1024, defValue)
-			} else if lastTwoBytes == "KB" {
+			case "KB":
 				return toInt(v[:len(v)-2], 1024, defValue)
 			}
 		}
@@ -551,11 +684,6 @@ func (c *Config) parseGroup(cfg *ini.Ini) {
 		if strings.HasPrefix(section.Name, "group:") {
 			entry := c.createEntry(section.Name, c.GetConfigFileDir())
 			entry.parse(section)
-			groupName := entry.GetGroupName()
-			programs := entry.GetPrograms()
-			for _, program := range programs {
-				c.ProgramGroup.Add(groupName, program)
-			}
 		}
 	}
 }
@@ -591,7 +719,7 @@ func (c *Config) parseProgram(cfg *ini.Ini) []string {
 			}
 			procName, err := section.GetValue("process_name")
 			if numProcs > 1 {
-				if err != nil || strings.Index(procName, "%(process_num)") == -1 {
+				if err != nil || !strings.Contains(procName, "%(process_num)") {
 					log.WithFields(log.Fields{
 						"numprocs":     numProcs,
 						"process_name": procName,
@@ -608,7 +736,7 @@ func (c *Config) parseProgram(cfg *ini.Ini) []string {
 			for i := 1; i <= numProcs; i++ {
 				envs := NewStringExpression("program_name", programName,
 					"process_num", fmt.Sprintf("%d", i),
-					"group_name", c.ProgramGroup.GetGroup(programName, programName),
+					"group_name", c.GetProgramGroup(programName),
 					"here", c.GetConfigFileDir())
 				envValue, err := section.GetValue("environment")
 				if err == nil {
@@ -641,7 +769,7 @@ func (c *Config) parseProgram(cfg *ini.Ini) []string {
 				entry := c.createEntry(procName, c.GetConfigFileDir())
 				entry.parse(section)
 				entry.Name = prefix + procName
-				group := c.ProgramGroup.GetGroup(programName, programName)
+				group := c.GetProgramGroup(programName)
 				entry.Group = group
 				loadedPrograms = append(loadedPrograms, procName)
 			}
@@ -663,5 +791,59 @@ func (c *Config) String() string {
 // RemoveProgram removes program entry by its name
 func (c *Config) RemoveProgram(programName string) {
 	delete(c.entries, programName)
-	c.ProgramGroup.Remove(programName)
+}
+
+// Sub compares the current configuration with the other configuration and returns the difference between them. It identifies added, removed, and changed groups and programs, providing a comprehensive overview of the changes between the two configurations.
+// The result is encapsulated in a ConfigSubResult struct, which contains slices of added, removed, and changed groups and programs.
+func (c *Config) Sub(other *Config) (*ConfigSubResult, error) {
+	result := &ConfigSubResult{
+		AddedGroups:     make([]string, 0),
+		AddedPrograms:   make([]string, 0),
+		RemovedGroups:   make([]string, 0),
+		RemovedPrograms: make([]string, 0),
+		ChangedGroups:   make([]string, 0),
+		ChangedPrograms: make([]string, 0),
+	}
+
+	// Compare the new group entries with the old group entries to find out which groups are added, changed
+	for key, myEntry := range c.entries {
+		otherEntry, ok := other.entries[key]
+		if !ok {
+			if myEntry.IsGroup() {
+				result.AddedGroups = append(result.AddedGroups, myEntry.GetGroupName())
+			} else if myEntry.IsProgram() {
+				if c.GetProgramGroup(myEntry.GetProgramName()) == myEntry.GetProgramName() {
+					result.AddedGroups = append(result.AddedGroups, myEntry.GetProgramName())
+				}
+				result.AddedPrograms = append(result.AddedPrograms, myEntry.GetProgramName())
+			}
+		} else if !myEntry.IsSame(otherEntry) {
+			if myEntry.IsGroup() {
+				result.ChangedGroups = append(result.ChangedGroups, myEntry.GetGroupName())
+			} else if myEntry.IsProgram() {
+				if c.GetProgramGroup(myEntry.GetProgramName()) == myEntry.GetProgramName() {
+					result.ChangedGroups = append(result.ChangedGroups, myEntry.GetProgramName())
+				}
+				result.ChangedPrograms = append(result.ChangedPrograms, myEntry.GetProgramName())
+			}
+		}
+
+	}
+
+	for key, otherEntry := range other.entries {
+		if _, ok := c.entries[key]; !ok {
+			if otherEntry.IsGroup() {
+				result.RemovedGroups = append(result.RemovedGroups, otherEntry.GetGroupName())
+			} else if otherEntry.IsProgram() {
+				if other.GetProgramGroup(otherEntry.GetProgramName()) == otherEntry.GetProgramName() {
+					result.RemovedGroups = append(result.RemovedGroups, otherEntry.GetProgramName())
+				}
+				result.RemovedPrograms = append(result.RemovedPrograms, otherEntry.GetProgramName())
+			}
+		} else {
+			// already compared in the previous loop
+		}
+	}
+
+	return result, nil
 }

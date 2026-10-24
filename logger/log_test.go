@@ -6,11 +6,20 @@ import (
 )
 
 func TestWriteSingleLog(t *testing.T) {
-	logger := NewFileLogger("test.log", int64(50), 2, NewNullLogEventEmitter(), NewNullLocker())
-	for i := 0; i < 10; i++ {
-		logger.Write([]byte(fmt.Sprintf("this is a test %d\n", i)))
+	logger := NewFileLogger("test.log", int64(50), 2, false, NewNullLogEventEmitter(), NewNullLocker())
+	for i := range 10 {
+		fmt.Fprintf(logger, "this is a test %d\n", i)
 	}
 	logger.Close()
+}
+
+// TestChanLoggerDoubleClose verifies that Close() is safe to call multiple
+// times. Previously this panicked via a channel double-close.
+func TestChanLoggerDoubleClose(t *testing.T) {
+	ch := make(chan []byte, 1)
+	logger := NewChanLogger(ch)
+	logger.Close()
+	logger.Close() // must not panic
 }
 
 func TestSplitLogFile(t *testing.T) {

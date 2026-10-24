@@ -1,12 +1,15 @@
-// +build !windows,!darwin
+//go:build !windows && !darwin && !freebsd && !aix
+// +build !windows,!darwin,!freebsd,!aix
 
 package signals
 
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var signalMap = map[string]os.Signal{"SIGABRT": syscall.SIGABRT,
@@ -59,15 +62,55 @@ func ToSignal(signalName string) (os.Signal, error) {
 // Kill sends signal to the process
 //
 // Args:
-//    process - the process which the signal should be sent to
-//    sig - the signal will be sent
-//    sigChildren - true if the signal needs to be sent to the children also
 //
-func Kill(process *os.Process, sig os.Signal, sigChildren bool) error {
-	localSig := sig.(syscall.Signal)
-	pid := process.Pid
-	if sigChildren {
-		pid = -pid
+//	process - the process which the signal should be sent to
+//	sigs - the signals will be sent
+//	sigChildren - true if the signal needs to be sent to the children also
+func Kill(process *os.Process, sigs []string, sigChildren bool, stopWaitSecs int) error {
+
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGCHLD)
+	defer signal.Stop(signalChan)
+
+	for _, sigStr := range sigs {
+		sig, err := ToSignal(sigStr)
+		if err != nil {
+			continue
+		}
+		localSig := sig.(syscall.Signal)
+		pid := process.Pid
+		if sigChildren {
+			pid = -pid
+		}
+
+		err = syscall.Kill(pid, localSig)
+		if err != nil {
+			continue
+		}
+		if waitForExit(process.Pid, signalChan, time.Duration(stopWaitSecs)*time.Second) {
+			return nil
+		}
 	}
-	return syscall.Kill(pid, localSig)
+	return nil
+
+}
+
+// waitForExit waits until the process pid has exited (and been reaped), or the
+// timeout passes. SIGCHLD is delivered when *any* child exits, so it's only a
+// hint to check again; the process itself is polled with kill(pid, 0).
+func waitForExit(pid int, sigchld <-chan os.Signal, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if syscall.Kill(pid, 0) == syscall.ESRCH {
+			return true
+		}
+		select {
+		case <-sigchld:
+		case <-tick.C:
+		case <-deadline:
+			return false
+		}
+	}
 }
